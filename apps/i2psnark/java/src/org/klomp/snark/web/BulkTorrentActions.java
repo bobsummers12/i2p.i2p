@@ -13,12 +13,15 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Stop-all-seeding and remove-all decisions for I2PSnark.
+ * Stop-all-seeding and remove-stopped decisions for I2PSnark.
  *
- * Removal deletes only a torrent's .torrent metadata file. It never deletes
- * the downloaded file or directory, including partial data. The destructive
- * steps run only for POST, and only after the one-time confirmation token
- * matches. Cancel and a missing or wrong token change nothing.
+ * Remove stopped deletes .torrent metadata only for torrents whose stopped
+ * flag is set, that are not starting, rechecking, or allocating, and that
+ * have a .torrent file. It never deletes downloaded or partial data.
+ * Rates are not consulted: stalled, downloading, and seeding are not stopped.
+ * The destructive steps run only for POST, and only after the one-time
+ * confirmation token matches. Cancel and a missing or wrong token change nothing.
+ * Stopped state is read again immediately before each removal.
  *
  * This class does not open tunnels or talk to peers. The servlet supplies
  * the stop and remove callbacks.
@@ -28,7 +31,7 @@ import java.util.Locale;
 public final class BulkTorrentActions {
 
     public static final String ACTION_STOP = "StopSeeding";
-    public static final String ACTION_REMOVE = "RemoveAll";
+    public static final String ACTION_REMOVE = "RemoveStopped";
     public static final String ACTION_CANCEL = "CancelBulk";
 
     public static final String MSG_BAD_METHOD =
@@ -39,18 +42,20 @@ public final class BulkTorrentActions {
         "No running completed torrents. Incomplete downloads were left running. Downloaded files were not deleted.";
     public static final String MSG_NEED_STOP =
         "Stop {0} seeding torrents? Only running completed torrents are stopped. Incomplete downloads keep running. Downloaded files are not deleted.";
+    public static final String MSG_NONE_STOPPED =
+        "No stopped torrents with a .torrent file. Nothing was changed. Downloaded data was not deleted.";
     public static final String MSG_NEED_REMOVE =
-        "Remove all {0} torrents from the active list, including stopped torrents and magnets, and delete the .torrent metadata files? Downloaded files and partial data directories are kept and will not be deleted.";
+        "Remove stopped torrents: remove {0} stopped torrents and delete their .torrent metadata files? Running, seeding, downloading, stalled, rechecking, starting, and allocating torrents are left alone. Magnets and torrent fetches are left alone. Downloaded files and partial data directories are kept and will not be deleted.";
     public static final String MSG_CANCELLED =
         "Cancelled. No torrents were changed. Downloaded data was not deleted.";
     public static final String MSG_STOPPED =
         "Stopped {0} seeding torrents. Incomplete downloads were left running. Downloaded files were not deleted.";
     public static final String MSG_REMOVED =
-        "Removed {0} torrents from the active list. .torrent metadata files were deleted when present. Downloaded files and partial data directories were not deleted.";
+        "Removed {0} stopped torrents. Their .torrent metadata files were deleted. Downloaded files and partial data directories were not deleted.";
     public static final String MSG_REMOVE_PARTIAL =
-        "Removed {0} torrents from the active list. Some metadata could not be deleted. Downloaded files and partial data directories were not deleted.";
+        "Removed {0} stopped torrents. Some .torrent metadata files could not be deleted. Downloaded files and partial data directories were not deleted.";
     public static final String MSG_REMOVE_NONE =
-        "No torrents were removed. Downloaded files and partial data directories were not deleted.";
+        "No stopped torrents were removed. Downloaded files and partial data directories were not deleted.";
 
     public static final String REASON_NOT_FILE =
         "Refusing to delete metadata because it is not a .torrent file.";
@@ -66,6 +71,9 @@ public final class BulkTorrentActions {
         "Torrent was not found.";
     public static final String REASON_CALLBACK =
         "The torrent could not be updated.";
+    /** Execution-time recheck: started, or otherwise no longer explicitly stopped. */
+    public static final String REASON_NO_LONGER_STOPPED =
+        "Left in place because it is no longer stopped.";
 
     /** Leave the torrent on the list. Do not delete its data files. */
     public interface Stopper {
@@ -85,6 +93,15 @@ public final class BulkTorrentActions {
         boolean delete(File file);
     }
 
+    /**
+     * Read the torrent again immediately before removal.
+     * Return false if it is no longer explicitly stopped.
+     * A null checker trusts the snapshot flags on the entry.
+     */
+    public interface StillStopped {
+        boolean isExplicitlyStopped(Entry entry);
+    }
+
     public static final class Entry {
         public final String id;
         public final String displayName;
@@ -97,10 +114,14 @@ public final class BulkTorrentActions {
         public final File metadata;
         /** Downloaded file or directory, or null if this torrent has no storage yet. */
         public final File payload;
+        /** {@link org.klomp.snark.Snark#isStarting()}: stopped flag still true while startup runs. */
+        public final boolean starting;
+        /** File allocation in progress. Not the same as stopped. */
+        public final boolean allocating;
 
         public Entry(String id, String displayName, boolean stopped, boolean checking,
                      boolean hasMetaInfo, boolean fetchOrMagnet, boolean storageComplete,
-                     File metadata, File payload) {
+                     File metadata, File payload, boolean starting, boolean allocating) {
             this.id = id;
             this.displayName = displayName != null ? displayName : "";
             this.stopped = stopped;
@@ -110,6 +131,8 @@ public final class BulkTorrentActions {
             this.storageComplete = storageComplete;
             this.metadata = metadata;
             this.payload = payload;
+            this.starting = starting;
+            this.allocating = allocating;
         }
     }
 
@@ -185,6 +208,35 @@ public final class BulkTorrentActions {
         return n;
     }
 
+    /**
+     * Explicitly stopped, not starting, rechecking, or allocating, not a magnet
+     * or fetch, and it has a .torrent metadata path. Upload and download rates
+     * are ignored. Stalled is not stopped.
+     */
+    public static boolean isStoppedWithMetadata(Entry entry) {
+        return entry != null
+            && entry.stopped
+            && !entry.starting
+            && !entry.checking
+            && !entry.allocating
+            && entry.hasMetaInfo
+            && !entry.fetchOrMagnet
+            && entry.metadata != null;
+    }
+
+    /** Stopped rows whose .torrent file is present. Missing files are not removable. */
+    public static int countRemovableStopped(List<Entry> entries) {
+        int n = 0;
+        if (entries == null)
+            return 0;
+        for (int i = 0; i < entries.size(); i++) {
+            Entry entry = entries.get(i);
+            if (isStoppedWithMetadata(entry) && entry.metadata.exists())
+                n++;
+        }
+        return n;
+    }
+
     public static Pending parsePending(String stored) {
         if (stored == null)
             return null;
@@ -210,6 +262,17 @@ public final class BulkTorrentActions {
     public static Outcome dispatch(String method, String action, List<Entry> entries,
                                    String storedPending, String confirmParam, String newToken,
                                    Stopper stopper, Remover remover, FileDeleter deleter) {
+        return dispatch(method, action, entries, storedPending, confirmParam, newToken,
+                        stopper, remover, deleter, null);
+    }
+
+    /**
+     * @param stillStopped live recheck immediately before each removal; null trusts the snapshot
+     */
+    public static Outcome dispatch(String method, String action, List<Entry> entries,
+                                   String storedPending, String confirmParam, String newToken,
+                                   Stopper stopper, Remover remover, FileDeleter deleter,
+                                   StillStopped stillStopped) {
         if (!"POST".equals(method))
             return new Outcome(Kind.NO_OP, MSG_BAD_METHOD, -1, null, false, null);
         if (ACTION_CANCEL.equals(action))
@@ -219,7 +282,7 @@ public final class BulkTorrentActions {
         if (ACTION_STOP.equals(action))
             return stopSeeding(entries, storedPending, confirmParam, newToken, stopper);
         if (ACTION_REMOVE.equals(action))
-            return removeAll(entries, storedPending, confirmParam, newToken, remover, deleter);
+            return removeStopped(entries, storedPending, confirmParam, newToken, remover, deleter, stillStopped);
         return new Outcome(Kind.NO_OP, MSG_BAD_METHOD, -1, null, false, null);
     }
 
@@ -248,29 +311,37 @@ public final class BulkTorrentActions {
         return new Outcome(Kind.APPLIED, MSG_STOPPED, stopped, null, true, failures);
     }
 
-    private static Outcome removeAll(List<Entry> entries, String storedPending, String confirmParam,
-                                     String newToken, Remover remover, FileDeleter deleter) {
-        int count = 0;
+    private static Outcome removeStopped(List<Entry> entries, String storedPending, String confirmParam,
+                                         String newToken, Remover remover, FileDeleter deleter,
+                                         StillStopped stillStopped) {
+        boolean any = false;
         for (int i = 0; i < entries.size(); i++) {
             if (entries.get(i) != null)
-                count++;
+                any = true;
         }
-        if (count == 0)
+        if (!any)
             return new Outcome(Kind.NO_OP, MSG_NONE_LOADED, -1, null, true, null);
+        int count = countRemovableStopped(entries);
+        if (count == 0)
+            return new Outcome(Kind.NO_OP, MSG_NONE_STOPPED, -1, null, true, null);
         if (!confirmed(ACTION_REMOVE, storedPending, confirmParam))
             return needsConfirm(ACTION_REMOVE, count, newToken, MSG_NEED_REMOVE);
         List<Failure> failures = new ArrayList<Failure>();
         int unlisted = 0;
+        int metaFailures = 0;
         for (int i = 0; i < entries.size(); i++) {
             Entry entry = entries.get(i);
-            if (entry == null)
+            if (!isStoppedWithMetadata(entry) || !entry.metadata.exists())
                 continue;
-            if (!entry.fetchOrMagnet && entry.metadata != null) {
-                String unsafe = unsafeMetadata(entry.metadata, entry.payload);
-                if (unsafe != null) {
-                    failures.add(new Failure(entry.displayName, unsafe));
-                    continue;
-                }
+            if (stillStopped != null && !stillStopped.isExplicitlyStopped(entry)) {
+                failures.add(new Failure(entry.displayName, REASON_NO_LONGER_STOPPED));
+                continue;
+            }
+            String unsafe = unsafeMetadata(entry.metadata, entry.payload);
+            if (unsafe != null) {
+                failures.add(new Failure(entry.displayName, unsafe));
+                metaFailures++;
+                continue;
             }
             try {
                 if (remover == null)
@@ -278,29 +349,29 @@ public final class BulkTorrentActions {
                 remover.removeFromList(entry);
             } catch (Exception e) {
                 failures.add(new Failure(entry.displayName, reasonOf(e)));
+                metaFailures++;
                 continue;
             }
             unlisted++;
-            if (!entry.fetchOrMagnet && entry.metadata != null && entry.metadata.exists()) {
-                boolean deleted = false;
-                try {
-                    File canon = entry.metadata.getCanonicalFile();
-                    if (deleter != null)
-                        deleted = deleter.delete(canon);
-                    if (!deleted || canon.exists())
-                        deleted = false;
-                } catch (IOException ioe) {
+            boolean deleted = false;
+            try {
+                File canon = entry.metadata.getCanonicalFile();
+                if (deleter != null)
+                    deleted = deleter.delete(canon);
+                if (!deleted || canon.exists())
                     deleted = false;
-                }
-                if (!deleted) {
-                    // Already off the list. Do not touch the payload to "clean up".
-                    failures.add(new Failure(entry.displayName, REASON_DELETE_FAILED));
-                }
+            } catch (IOException ioe) {
+                deleted = false;
+            }
+            if (!deleted) {
+                // Already off the list. Do not touch the payload to "clean up".
+                failures.add(new Failure(entry.displayName, REASON_DELETE_FAILED));
+                metaFailures++;
             }
         }
         if (unlisted == 0)
             return new Outcome(Kind.APPLIED, MSG_REMOVE_NONE, -1, null, true, failures);
-        String key = failures.isEmpty() ? MSG_REMOVED : MSG_REMOVE_PARTIAL;
+        String key = metaFailures == 0 ? MSG_REMOVED : MSG_REMOVE_PARTIAL;
         return new Outcome(Kind.APPLIED, key, unlisted, null, true, failures);
     }
 
@@ -382,15 +453,29 @@ public final class BulkTorrentActions {
     }
 
     public static String toolbarButton(String action, String imgSrc, String title) {
-        return "<button type=\"submit\" name=\"action\" value=\"" + escapeHtml(action) + "\""
-             + " class=\"snarkBulkBtn\" title=\"" + escapeHtml(title) + "\""
-             + " aria-label=\"" + escapeHtml(title) + "\""
-             + " style=\"background:transparent;border:0;padding:0;margin:0 1px;cursor:pointer;vertical-align:middle;\">"
-             + "<img src=\"" + escapeHtml(imgSrc) + "\" alt=\"\">"
-             + "<span class=\"bulkStar\" aria-hidden=\"true\""
-             + " style=\"color:#900;background:#fff;border:1px solid #000;font-weight:700;"
-             + "font-size:12px;line-height:1;padding:0 2px;margin-left:1px;vertical-align:super;\">*</span>"
-             + "</button>";
+        return toolbarButton(action, imgSrc, title, null);
+    }
+
+    /**
+     * @param visibleLabel short button text, or null to keep an icon-only control
+     */
+    public static String toolbarButton(String action, String imgSrc, String title, String visibleLabel) {
+        StringBuilder buf = new StringBuilder(256);
+        buf.append("<button type=\"submit\" name=\"action\" value=\"").append(escapeHtml(action)).append("\"");
+        buf.append(" class=\"snarkBulkBtn\" title=\"").append(escapeHtml(title)).append("\"");
+        buf.append(" aria-label=\"").append(escapeHtml(title)).append("\"");
+        buf.append(" style=\"background:transparent;border:0;padding:0;margin:0 1px;cursor:pointer;vertical-align:middle;\">");
+        buf.append("<img src=\"").append(escapeHtml(imgSrc)).append("\" alt=\"\">");
+        buf.append("<span class=\"bulkStar\" aria-hidden=\"true\"");
+        buf.append(" style=\"color:#900;background:#fff;border:1px solid #000;font-weight:700;");
+        buf.append("font-size:12px;line-height:1;padding:0 2px;margin-left:1px;vertical-align:super;\">*</span>");
+        if (visibleLabel != null && visibleLabel.length() > 0) {
+            buf.append("<span class=\"snarkBulkLabel\"");
+            buf.append(" style=\"font-weight:bold;font-size:11px;margin-left:2px;vertical-align:middle;\">");
+            buf.append(escapeHtml(visibleLabel)).append("</span>");
+        }
+        buf.append("</button>");
+        return buf.toString();
     }
 
     public static String confirmForm(String action, String token, String nonce, String explanation,

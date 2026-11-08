@@ -5177,7 +5177,8 @@ public class I2PSnarkServlet extends BasicServlet {
             _t("Stop all seeding torrents. Only running completed torrents are stopped. Incomplete downloads keep running. Downloaded files are not deleted. Asks for confirmation.")));
         out.write(BulkTorrentActions.toolbarButton(BulkTorrentActions.ACTION_REMOVE,
             _imgPath + "remove.png",
-            _t("Remove all torrents from the active list, including stopped torrents and magnets, and delete the .torrent metadata files. Downloaded files and partial data directories are not deleted. Asks for confirmation.")));
+            _t("Remove stopped torrents. Only torrents that are already stopped, and that have a .torrent file, are removed. Running, seeding, downloading, stalled, rechecking, starting, and allocating torrents are left alone. Magnets and torrent fetches are left alone. Downloaded files and partial data directories are not deleted. Asks for confirmation."),
+            _t("Remove stopped torrents")));
     }
 
     /**
@@ -5194,7 +5195,8 @@ public class I2PSnarkServlet extends BasicServlet {
             return;
         List<BulkTorrentActions.Entry> entries = snapshotEntries();
         int count = BulkTorrentActions.ACTION_STOP.equals(pending.action)
-            ? BulkTorrentActions.countSeeding(entries) : entries.size();
+            ? BulkTorrentActions.countSeeding(entries)
+            : BulkTorrentActions.countRemovableStopped(entries);
         String explanation = BulkTorrentActions.ACTION_STOP.equals(pending.action)
             ? _t(BulkTorrentActions.MSG_NEED_STOP, Integer.valueOf(count))
             : _t(BulkTorrentActions.MSG_NEED_REMOVE, Integer.valueOf(count));
@@ -5247,6 +5249,21 @@ public class I2PSnarkServlet extends BasicServlet {
                 public boolean delete(File file) {
                     return file.delete();
                 }
+            },
+            new BulkTorrentActions.StillStopped() {
+                public boolean isExplicitlyStopped(BulkTorrentActions.Entry entry) {
+                    Snark snark = byId.get(entry.id);
+                    if (snark == null || snark instanceof FetchAndAdd)
+                        return false;
+                    if (snark.getMetaInfo() == null)
+                        return false;
+                    // isStopped() is the stopped flag. Stalled, seeding, and
+                    // downloading are running, so isStopped() is false.
+                    // Starting keeps the flag true until startup finishes.
+                    if (!snark.isStopped() || snark.isStarting() || snark.isChecking() || snark.isAllocating())
+                        return false;
+                    return true;
+                }
             });
         if (session != null) {
             if (outcome.pendingToStore != null)
@@ -5285,7 +5302,7 @@ public class I2PSnarkServlet extends BasicServlet {
         return new BulkTorrentActions.Entry(id, snark.getBaseName(), snark.isStopped(), snark.isChecking(),
                                             meta != null && !fetch, magnet,
                                             storage != null && !fetch && storage.complete(),
-                                            metadata, payload);
+                                            metadata, payload, snark.isStarting(), snark.isAllocating());
     }
 
     /**

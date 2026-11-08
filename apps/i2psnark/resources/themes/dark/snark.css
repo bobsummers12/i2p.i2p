@@ -3395,6 +3395,12 @@ button.snarkBulkBtn:focus {
      outline: 2px solid #f60;
      outline-offset: 1px;
 }
+button.snarkBulkBtn .snarkBulkLabel {
+     font-weight: bold;
+     font-size: 11px;
+     margin-left: 2px;
+     vertical-align: middle;
+}
 form.snarkBulkConfirm {
      background: #fff;
      color: #111;

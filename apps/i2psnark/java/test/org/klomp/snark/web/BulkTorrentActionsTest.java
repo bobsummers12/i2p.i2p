@@ -51,10 +51,13 @@ public class BulkTorrentActionsTest {
         check("stop applies only to running complete torrents and keeps every payload byte",
               stopAppliesOnlyToSeeding());
         check("remove asks, cancel is a no-op, and GET does not delete", removeConfirmCancelAndGet());
-        check("confirmed remove deletes only metadata and keeps payload bytes and directories",
+        check("confirmed remove deletes only stopped metadata and keeps every payload",
               removeKeepsPayload());
-        check("magnet and stopped torrents are removed while their partial data stays",
+        check("stopped magnets are left in place and their partial data stays",
               magnetAndStopped());
+        check("mixed running stalled downloading rechecking starting rows stay put",
+              mixedOnlyStoppedRemoved());
+        check("a torrent restarted since confirmation is skipped", restartedSinceConfirmation());
         check("unsafe metadata is reported and left in place", unsafeMetadataReported());
         check("a failed metadata delete is reported and does not touch the payload",
               deleteFailureReported());
@@ -174,7 +177,8 @@ public class BulkTorrentActionsTest {
                 "POST", BulkTorrentActions.ACTION_CANCEL, fix.entries, ask.pendingToStore, "42", "7",
                 recorder, recorder, recorder);
             return ask.kind == BulkTorrentActions.Kind.NEEDS_CONFIRM
-                && ask.count == 4
+                && ask.count == 1
+                && ask.messageKey.startsWith("Remove stopped torrents:")
                 && ask.messageKey.contains("kept and will not be deleted")
                 && get.kind == BulkTorrentActions.Kind.NO_OP
                 && BulkTorrentActions.MSG_BAD_METHOD.equals(get.messageKey)
@@ -199,18 +203,18 @@ public class BulkTorrentActionsTest {
                 "POST", BulkTorrentActions.ACTION_REMOVE, fix.entries, pending, "99", "1",
                 recorder, recorder, recorder);
             Map<String, byte[]> payloadAfter = fix.payloadSnapshot();
-            boolean metaGone = !fix.metadata("seed.torrent").exists()
-                && !fix.metadata("partial.torrent").exists()
+            boolean onlyStoppedMetaGone = fix.metadata("seed.torrent").isFile()
+                && fix.metadata("partial.torrent").isFile()
                 && !fix.metadata("stopped.torrent").exists();
             boolean dirsRemain = new File(fix.root, "partial-data").isDirectory()
                 && new File(fix.root, "partial-data/nested").isDirectory()
                 && new File(fix.root, "magnet-data").isDirectory();
             return applied.kind == BulkTorrentActions.Kind.APPLIED
-                && applied.count == 4
+                && applied.count == 1
                 && applied.failures.isEmpty()
                 && BulkTorrentActions.MSG_REMOVED.equals(applied.messageKey)
-                && recorder.removed.size() == 4
-                && metaGone
+                && recorder.removed.equals(Arrays.asList("stopped"))
+                && onlyStoppedMetaGone
                 && sameSnap(payloadBefore, payloadAfter)
                 && dirsRemain
                 && new File(fix.root, "notes.txt").isFile()
@@ -235,8 +239,9 @@ public class BulkTorrentActionsTest {
                 "POST", BulkTorrentActions.ACTION_REMOVE, subset,
                 BulkTorrentActions.ACTION_REMOVE + "\n3", "3", "1",
                 recorder, recorder, recorder);
-            return applied.count == 2
-                && recorder.removed.equals(Arrays.asList("stopped", "magnet"))
+            return applied.count == 1
+                && recorder.removed.equals(Arrays.asList("stopped"))
+                && !recorder.removed.contains("magnet")
                 && !fix.metadata("stopped.torrent").exists()
                 && fix.metadata("seed.torrent").exists()
                 && sameSnap(before, fix.payloadSnapshot())
@@ -312,14 +317,15 @@ public class BulkTorrentActionsTest {
     private boolean deleteFailureReported() throws Exception {
         Fixture fix = Fixture.mixed();
         try {
-            final File doomed = fix.metadata("seed.torrent");
+            final File doomed = fix.metadata("stopped.torrent");
             byte[] seedMeta = read(doomed);
+            byte[] runningMeta = read(fix.metadata("seed.torrent"));
             Map<String, byte[]> payloadBefore = fix.payloadSnapshot();
             Recorder recorder = new Recorder(true) {
                 @Override
                 public boolean delete(File file) {
                     deleted.add(file.getPath());
-                    if (file.getName().equals("seed.torrent"))
+                    if (file.getName().equals("stopped.torrent"))
                         return false;
                     return file.delete();
                 }
@@ -331,17 +337,20 @@ public class BulkTorrentActionsTest {
             boolean seedFailed = false;
             for (int i = 0; i < applied.failures.size(); i++) {
                 BulkTorrentActions.Failure failure = applied.failures.get(i);
-                if ("Seed".equals(failure.name) && BulkTorrentActions.REASON_DELETE_FAILED.equals(failure.reason))
+                if ("Stopped".equals(failure.name) && BulkTorrentActions.REASON_DELETE_FAILED.equals(failure.reason))
                     seedFailed = true;
             }
-            return applied.count == 4
+            return applied.count == 1
                 && BulkTorrentActions.MSG_REMOVE_PARTIAL.equals(applied.messageKey)
                 && seedFailed
                 && doomed.isFile()
                 && Arrays.equals(seedMeta, read(doomed))
-                && !fix.metadata("partial.torrent").exists()
+                && Arrays.equals(runningMeta, read(fix.metadata("seed.torrent")))
+                && fix.metadata("partial.torrent").isFile()
                 && sameSnap(payloadBefore, fix.payloadSnapshot())
-                && recorder.removed.contains("seed");
+                && recorder.removed.equals(Arrays.asList("stopped"))
+                && !recorder.removed.contains("seed")
+                && !recorder.removed.contains("partial");
         } finally {
             fix.delete();
         }
@@ -353,7 +362,7 @@ public class BulkTorrentActionsTest {
             Recorder recorder = new Recorder(true) {
                 @Override
                 public void removeFromList(BulkTorrentActions.Entry entry) {
-                    if ("partial".equals(entry.id))
+                    if ("stopped".equals(entry.id))
                         throw new IllegalStateException("disk busy");
                     super.removeFromList(entry);
                 }
@@ -364,16 +373,19 @@ public class BulkTorrentActionsTest {
                 recorder, recorder, recorder);
             boolean saw = false;
             for (int i = 0; i < applied.failures.size(); i++) {
-                if ("Down".equals(applied.failures.get(i).name)
+                if ("Stopped".equals(applied.failures.get(i).name)
                         && "disk busy".equals(applied.failures.get(i).reason))
                     saw = true;
             }
-            return applied.count == 3
+            return applied.kind == BulkTorrentActions.Kind.APPLIED
+                && BulkTorrentActions.MSG_REMOVE_NONE.equals(applied.messageKey)
                 && saw
-                && fix.metadata("partial.torrent").exists()
-                && !fix.metadata("seed.torrent").exists()
+                && fix.metadata("partial.torrent").isFile()
+                && fix.metadata("seed.torrent").isFile()
+                && fix.metadata("stopped.torrent").isFile()
+                && !recorder.removed.contains("stopped")
                 && !recorder.removed.contains("partial")
-                && recorder.removed.contains("magnet");
+                && !recorder.removed.contains("magnet");
         } finally {
             fix.delete();
         }
@@ -426,16 +438,150 @@ public class BulkTorrentActionsTest {
         }
     }
 
+    private boolean mixedOnlyStoppedRemoved() throws Exception {
+        File root = Files.createTempDirectory("i2psnark-mixed-").toFile();
+        try {
+            write(new File(root, "seed.torrent"), bytes(1, 20));
+            write(new File(root, "seed-data.bin"), bytes(2, 40));
+            write(new File(root, "down.torrent"), bytes(3, 20));
+            write(new File(root, "down-data/part.bin"), bytes(4, 40));
+            write(new File(root, "stalled.torrent"), bytes(5, 20));
+            write(new File(root, "stalled-data.bin"), bytes(6, 40));
+            write(new File(root, "recheck.torrent"), bytes(7, 20));
+            write(new File(root, "recheck-data.bin"), bytes(8, 40));
+            write(new File(root, "starting.torrent"), bytes(9, 20));
+            write(new File(root, "starting-data.bin"), bytes(10, 40));
+            write(new File(root, "alloc.torrent"), bytes(11, 20));
+            write(new File(root, "alloc-data.bin"), bytes(12, 40));
+            write(new File(root, "stopped-a.torrent"), bytes(13, 20));
+            write(new File(root, "stopped-a-data.bin"), bytes(14, 40));
+            write(new File(root, "stopped-b.torrent"), bytes(15, 20));
+            write(new File(root, "stopped-b-data/nested.bin"), bytes(16, 40));
+            write(new File(root, "magnet-data/partial.bin"), bytes(17, 30));
+            write(new File(root, "notes.txt"), bytes(18, 16));
+            List<BulkTorrentActions.Entry> entries = new ArrayList<BulkTorrentActions.Entry>();
+            // Running complete (seeding). Zero rate is not represented; stopped is the only selector.
+            entries.add(entry("seed", "Seed", false, false, true, false, true,
+                              new File(root, "seed.torrent"), new File(root, "seed-data.bin")));
+            // Downloading, not stopped.
+            entries.add(entry("down", "Down", false, false, true, false, false,
+                              new File(root, "down.torrent"), new File(root, "down-data")));
+            // Stalled in the UI is still running (stopped flag false). Do not infer it from speed.
+            entries.add(entry("stalled", "Stalled", false, false, true, false, false,
+                              new File(root, "stalled.torrent"), new File(root, "stalled-data.bin")));
+            // Recheck keeps the stopped flag in I2PSnark. checking excludes it.
+            entries.add(entry("recheck", "Recheck", true, true, true, false, false,
+                              new File(root, "recheck.torrent"), new File(root, "recheck-data.bin")));
+            // Startup in progress: stopped flag is still true. starting excludes it.
+            entries.add(entry("starting", "Starting", true, false, true, false, false,
+                              new File(root, "starting.torrent"), new File(root, "starting-data.bin"), true, false));
+            entries.add(entry("alloc", "Alloc", true, false, true, false, false,
+                              new File(root, "alloc.torrent"), new File(root, "alloc-data.bin"), false, true));
+            entries.add(entry("stopped-a", "StoppedA", true, false, true, false, true,
+                              new File(root, "stopped-a.torrent"), new File(root, "stopped-a-data.bin")));
+            entries.add(entry("stopped-b", "StoppedB", true, false, true, false, false,
+                              new File(root, "stopped-b.torrent"), new File(root, "stopped-b-data")));
+            // Stopped magnet and a running fetch have no removable .torrent metadata.
+            entries.add(entry("magnet", "Magnet", true, false, false, true, false,
+                              null, new File(root, "magnet-data")));
+            entries.add(entry("fetch", "Fetch", false, false, false, true, false, null, null));
+            Map<String, byte[]> payloadBefore = new LinkedHashMap<String, byte[]>();
+            snapTree(root, "", payloadBefore);
+            Recorder recorder = new Recorder(true);
+            BulkTorrentActions.Outcome ask = BulkTorrentActions.dispatch(
+                "POST", BulkTorrentActions.ACTION_REMOVE, entries, null, null, "70",
+                recorder, recorder, recorder);
+            BulkTorrentActions.Outcome applied = BulkTorrentActions.dispatch(
+                "POST", BulkTorrentActions.ACTION_REMOVE, entries, ask.pendingToStore, "70", "1",
+                recorder, recorder, recorder);
+            Map<String, byte[]> after = new LinkedHashMap<String, byte[]>();
+            snapTree(root, "", after);
+            boolean othersRemain = new File(root, "seed.torrent").isFile()
+                && new File(root, "down.torrent").isFile()
+                && new File(root, "stalled.torrent").isFile()
+                && new File(root, "recheck.torrent").isFile()
+                && new File(root, "starting.torrent").isFile()
+                && new File(root, "alloc.torrent").isFile()
+                && !new File(root, "stopped-a.torrent").exists()
+                && !new File(root, "stopped-b.torrent").exists();
+            payloadBefore.remove("stopped-a.torrent");
+            payloadBefore.remove("stopped-b.torrent");
+            return ask.count == 2
+                && applied.count == 2
+                && applied.failures.isEmpty()
+                && recorder.removed.equals(Arrays.asList("stopped-a", "stopped-b"))
+                && othersRemain
+                && sameSnap(payloadBefore, after)
+                && new File(root, "magnet-data/partial.bin").isFile()
+                && new File(root, "down-data/part.bin").isFile()
+                && new File(root, "stopped-b-data/nested.bin").isFile()
+                && new File(root, "notes.txt").isFile();
+        } finally {
+            deleteTree(root);
+        }
+    }
+
+    private boolean restartedSinceConfirmation() throws Exception {
+        File root = Files.createTempDirectory("i2psnark-restart-").toFile();
+        try {
+            write(new File(root, "keep.torrent"), bytes(1, 24));
+            write(new File(root, "keep-data.bin"), bytes(2, 48));
+            write(new File(root, "gone.torrent"), bytes(3, 24));
+            write(new File(root, "gone-data.bin"), bytes(4, 48));
+            BulkTorrentActions.Entry restarted = entry("keep", "Keep", true, false, true, false, true,
+                                                       new File(root, "keep.torrent"), new File(root, "keep-data.bin"));
+            BulkTorrentActions.Entry still = entry("gone", "Gone", true, false, true, false, false,
+                                                   new File(root, "gone.torrent"), new File(root, "gone-data.bin"));
+            List<BulkTorrentActions.Entry> entries = new ArrayList<BulkTorrentActions.Entry>();
+            entries.add(restarted);
+            entries.add(still);
+            final List<String> liveStopped = new ArrayList<String>();
+            liveStopped.add("gone");
+            Recorder recorder = new Recorder(true);
+            BulkTorrentActions.StillStopped live = new BulkTorrentActions.StillStopped() {
+                public boolean isExplicitlyStopped(BulkTorrentActions.Entry entry) {
+                    return liveStopped.contains(entry.id);
+                }
+            };
+            byte[] keepMeta = read(new File(root, "keep.torrent"));
+            byte[] keepData = read(new File(root, "keep-data.bin"));
+            BulkTorrentActions.Outcome applied = BulkTorrentActions.dispatch(
+                "POST", BulkTorrentActions.ACTION_REMOVE, entries,
+                BulkTorrentActions.ACTION_REMOVE + "\n81", "81", "2",
+                recorder, recorder, recorder, live);
+            boolean skipped = false;
+            for (int i = 0; i < applied.failures.size(); i++) {
+                BulkTorrentActions.Failure failure = applied.failures.get(i);
+                if ("Keep".equals(failure.name)
+                        && BulkTorrentActions.REASON_NO_LONGER_STOPPED.equals(failure.reason))
+                    skipped = true;
+            }
+            return applied.count == 1
+                && BulkTorrentActions.MSG_REMOVED.equals(applied.messageKey)
+                && skipped
+                && recorder.removed.equals(Arrays.asList("gone"))
+                && !recorder.removed.contains("keep")
+                && new File(root, "keep.torrent").isFile()
+                && Arrays.equals(keepMeta, read(new File(root, "keep.torrent")))
+                && Arrays.equals(keepData, read(new File(root, "keep-data.bin")))
+                && !new File(root, "gone.torrent").exists()
+                && new File(root, "gone-data.bin").isFile();
+        } finally {
+            deleteTree(root);
+        }
+    }
+
     private boolean markup() {
         String stop = BulkTorrentActions.toolbarButton(
             BulkTorrentActions.ACTION_STOP, "/themes/dark/images/stop_all.png",
             "Stop all seeding torrents. Downloaded files are not deleted.");
         String remove = BulkTorrentActions.toolbarButton(
             BulkTorrentActions.ACTION_REMOVE, "/themes/dark/images/remove.png",
-            "Remove all torrents. Downloaded files and partial data directories are not deleted.");
+            "Remove stopped torrents. Downloaded files and partial data directories are not deleted.",
+            "Remove stopped torrents");
         String form = BulkTorrentActions.confirmForm(
             BulkTorrentActions.ACTION_REMOVE, "99", "SNA1",
-            "Remove all 2 torrents? Data <kept> & will not be deleted.",
+            "Remove stopped torrents? Data <kept> & will not be deleted.",
             "Confirm", "Cancel");
         return stop.contains("type=\"submit\"")
             && stop.contains("value=\"StopSeeding\"")
@@ -445,7 +591,9 @@ public class BulkTorrentActionsTest {
             && stop.contains("title=")
             && !stop.contains("href=")
             && remove.contains("remove.png")
-            && remove.contains("value=\"RemoveAll\"")
+            && remove.contains("value=\"RemoveStopped\"")
+            && remove.contains("Remove stopped torrents")
+            && !remove.contains("Remove all")
             && remove.contains(">*</span>")
             && !remove.contains("href=")
             && form.contains("method=\"POST\"")
@@ -453,7 +601,8 @@ public class BulkTorrentActionsTest {
             && !form.contains("href=")
             && form.contains("name=\"nonce\"")
             && form.contains("name=\"confirm\" value=\"99\"")
-            && form.contains("value=\"RemoveAll\"")
+            && form.contains("value=\"RemoveStopped\"")
+            && form.contains("Remove stopped torrents")
             && form.contains("value=\"CancelBulk\"")
             && form.contains("Confirm")
             && form.contains("Cancel")
@@ -502,7 +651,14 @@ public class BulkTorrentActionsTest {
     private static BulkTorrentActions.Entry entry(String id, String name, boolean stopped, boolean checking,
                                                   boolean hasMeta, boolean magnet, boolean complete,
                                                   File metadata, File payload) {
-        return new BulkTorrentActions.Entry(id, name, stopped, checking, hasMeta, magnet, complete, metadata, payload);
+        return entry(id, name, stopped, checking, hasMeta, magnet, complete, metadata, payload, false, false);
+    }
+
+    private static BulkTorrentActions.Entry entry(String id, String name, boolean stopped, boolean checking,
+                                                  boolean hasMeta, boolean magnet, boolean complete,
+                                                  File metadata, File payload, boolean starting, boolean allocating) {
+        return new BulkTorrentActions.Entry(id, name, stopped, checking, hasMeta, magnet, complete,
+                                            metadata, payload, starting, allocating);
     }
 
     private static byte[] bytes(int seed, int len) {
