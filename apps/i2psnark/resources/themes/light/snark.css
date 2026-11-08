@@ -2786,3 +2786,40 @@ a, a:link, th, td, button, input, select, textarea {
      background-size: 14px auto !important;
 }
 
+/* Bulk stop-seeding and remove-all. Icons stay the theme images; the star marks the new actions. */
+button.snarkBulkBtn {
+     background: transparent;
+     border: 0;
+     padding: 0;
+     margin: 0 1px;
+     cursor: pointer;
+     vertical-align: middle;
+}
+button.snarkBulkBtn:focus {
+     outline: 2px solid #f60;
+     outline-offset: 1px;
+}
+button.snarkBulkBtn .snarkBulkLabel {
+     font-weight: bold;
+     font-size: 11px;
+     margin-left: 2px;
+     vertical-align: middle;
+}
+form.snarkBulkConfirm {
+     background: #fff;
+     color: #111;
+     border: 2px solid #900;
+     padding: 8px 12px;
+     margin: 8px auto;
+     max-width: 740px;
+     text-align: left;
+}
+form.snarkBulkConfirm button {
+     background: #fff;
+     color: #111;
+     border: 1px solid #000;
+     padding: 4px 10px;
+     margin: 4px 8px 0 0;
+     font-weight: bold;
+}
+
