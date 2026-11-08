@@ -21,6 +21,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Enumeration;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
@@ -92,6 +93,8 @@ public class I2PSnarkServlet extends BasicServlet {
     private static final char HELLIP = '\u2026';
     private static final String SESSION_SNARK_NONCE1 = "__i2psnark.nonce1.queue__";
     private static final String SESSION_SNARK_NONCE2 = "__i2psnark.nonce2.queue__";
+    /** One-time confirmation for stop-seeding and remove-all. POST only. */
+    private static final String SESSION_BULK_CONFIRM = "__i2psnark.bulkConfirm";
     private static final int NONCE_QUEUE_SIZE = 10;
  
     public I2PSnarkServlet() {
@@ -515,6 +518,7 @@ public class I2PSnarkServlet extends BasicServlet {
         String peerParam = req.getParameter("p");
         String stParam = req.getParameter("st");
 
+        writeBulkConfirm(out, req);
         List<Snark> snarks = getSortedSnarks(req);
         boolean isForm = _manager.util().connected() || !snarks.isEmpty();
         if (isForm) {
@@ -769,6 +773,13 @@ public class I2PSnarkServlet extends BasicServlet {
                 out.write("</a>");
         } else {
             out.write("&nbsp;");
+        }
+        // Stop-seeding and remove-all sit beside Start All / Stop All.
+        // They submit this form with POST. They are not GET links.
+        if (!_manager.isStopping() &&
+            (_manager.util().connected() ||
+             (!_manager.util().isConnecting() && !snarks.isEmpty()))) {
+            writeBulkToolbar(out);
         }
         out.write("</th></tr>\n" +
                   "</thead>\n");
@@ -1635,6 +1646,10 @@ public class I2PSnarkServlet extends BasicServlet {
             } else {
                 _manager.addMessage(_t("Error creating torrent - you must enter a file or directory"));
             }
+        } else if (BulkTorrentActions.ACTION_STOP.equals(action)
+                || BulkTorrentActions.ACTION_REMOVE.equals(action)
+                || BulkTorrentActions.ACTION_CANCEL.equals(action)) {
+            handleBulk(req, action);
         } else if ("StopAll".equals(action)) {
             String search = req.getParameter("nf_s");
             if (search != null && search.length() > 0) {
@@ -5149,6 +5164,128 @@ public class I2PSnarkServlet extends BasicServlet {
                 return false;
         }
         return true;
+    }
+
+    /**
+     *  Toolbar buttons beside Start All / Stop All.
+     *  Icons are the theme's existing stop-all and remove icons, plus a visible star.
+     *  @since 2.14.1 custom build
+     */
+    private void writeBulkToolbar(PrintWriter out) {
+        out.write(BulkTorrentActions.toolbarButton(BulkTorrentActions.ACTION_STOP,
+            _imgPath + "stop_all.png",
+            _t("Stop all seeding torrents. Only running completed torrents are stopped. Incomplete downloads keep running. Downloaded files are not deleted. Asks for confirmation.")));
+        out.write(BulkTorrentActions.toolbarButton(BulkTorrentActions.ACTION_REMOVE,
+            _imgPath + "remove.png",
+            _t("Remove all torrents from the active list, including stopped torrents and magnets, and delete the .torrent metadata files. Downloaded files and partial data directories are not deleted. Asks for confirmation.")));
+    }
+
+    /**
+     *  Separate POST form so the confirmation token is not submitted by the toolbar buttons.
+     *  @since 2.14.1 custom build
+     */
+    private void writeBulkConfirm(PrintWriter out, HttpServletRequest req) {
+        HttpSession session = req.getSession(false);
+        if (session == null)
+            return;
+        String stored = (String) session.getAttribute(SESSION_BULK_CONFIRM);
+        BulkTorrentActions.Pending pending = BulkTorrentActions.parsePending(stored);
+        if (pending == null)
+            return;
+        List<BulkTorrentActions.Entry> entries = snapshotEntries();
+        int count = BulkTorrentActions.ACTION_STOP.equals(pending.action)
+            ? BulkTorrentActions.countSeeding(entries) : entries.size();
+        String explanation = BulkTorrentActions.ACTION_STOP.equals(pending.action)
+            ? _t(BulkTorrentActions.MSG_NEED_STOP, Integer.valueOf(count))
+            : _t(BulkTorrentActions.MSG_NEED_REMOVE, Integer.valueOf(count));
+        String nonce = getNonce(session, true);
+        out.write(BulkTorrentActions.confirmForm(pending.action, pending.token, nonce, explanation,
+                                                 _t("Confirm"), _t("Cancel")));
+    }
+
+    /**
+     *  POST only. A missing or wrong confirmation token does not stop or delete anything.
+     *  Remove deletes .torrent metadata only. stopTorrent(..., true) drops list and status;
+     *  it does not delete storage files. Payload paths are never passed to delete.
+     *  @since 2.14.1 custom build
+     */
+    private void handleBulk(HttpServletRequest req, String action) {
+        HttpSession session = req.getSession(false);
+        String stored = session != null ? (String) session.getAttribute(SESSION_BULK_CONFIRM) : null;
+        final Map<String, Snark> byId = new HashMap<String, Snark>();
+        List<BulkTorrentActions.Entry> entries = new ArrayList<BulkTorrentActions.Entry>();
+        for (Snark snark : _manager.getTorrents()) {
+            BulkTorrentActions.Entry entry = toBulkEntry(snark);
+            byId.put(entry.id, snark);
+            entries.add(entry);
+        }
+        String token = Long.toString(_context.random().nextLong() & Long.MAX_VALUE);
+        BulkTorrentActions.Outcome outcome = BulkTorrentActions.dispatch(
+            req.getMethod(), action, entries, stored, req.getParameter("confirm"), token,
+            new BulkTorrentActions.Stopper() {
+                public void stopLeavingOnList(BulkTorrentActions.Entry entry) {
+                    Snark snark = byId.get(entry.id);
+                    if (snark == null)
+                        throw new IllegalStateException(BulkTorrentActions.REASON_NOT_FOUND);
+                    // false: stay on the list, do not remove the .torrent or the data files
+                    _manager.stopTorrent(snark, false);
+                }
+            },
+            new BulkTorrentActions.Remover() {
+                public void removeFromList(BulkTorrentActions.Entry entry) {
+                    Snark snark = byId.get(entry.id);
+                    if (snark == null)
+                        throw new IllegalStateException(BulkTorrentActions.REASON_NOT_FOUND);
+                    if (entry.fetchOrMagnet)
+                        _manager.deleteMagnet(snark);
+                    else
+                        // true removes the list entry and saved status, not the downloaded files
+                        _manager.stopTorrent(snark, true);
+                }
+            },
+            new BulkTorrentActions.FileDeleter() {
+                public boolean delete(File file) {
+                    return file.delete();
+                }
+            });
+        if (session != null) {
+            if (outcome.pendingToStore != null)
+                session.setAttribute(SESSION_BULK_CONFIRM, outcome.pendingToStore);
+            else if (outcome.clearPending)
+                session.removeAttribute(SESSION_BULK_CONFIRM);
+        }
+        if (outcome.count >= 0)
+            _manager.addMessage(_t(outcome.messageKey, Integer.valueOf(outcome.count)));
+        else
+            _manager.addMessage(_t(outcome.messageKey));
+        for (BulkTorrentActions.Failure failure : outcome.failures) {
+            _manager.addMessage(_t("Could not update torrent {0}", failure.name) + ": " + _t(failure.reason));
+        }
+    }
+
+    /** @since 2.14.1 custom build */
+    private List<BulkTorrentActions.Entry> snapshotEntries() {
+        List<BulkTorrentActions.Entry> entries = new ArrayList<BulkTorrentActions.Entry>();
+        for (Snark snark : _manager.getTorrents())
+            entries.add(toBulkEntry(snark));
+        return entries;
+    }
+
+    /** @since 2.14.1 custom build */
+    private static BulkTorrentActions.Entry toBulkEntry(Snark snark) {
+        boolean fetch = snark instanceof FetchAndAdd;
+        MetaInfo meta = snark.getMetaInfo();
+        Storage storage = snark.getStorage();
+        boolean magnet = fetch || meta == null;
+        File metadata = magnet ? null : new File(snark.getName());
+        File payload = (!fetch && storage != null) ? storage.getBase() : null;
+        String id = snark.getName();
+        if (id == null || id.length() == 0)
+            id = snark.getBaseName();
+        return new BulkTorrentActions.Entry(id, snark.getBaseName(), snark.isStopped(), snark.isChecking(),
+                                            meta != null && !fetch, magnet,
+                                            storage != null && !fetch && storage.complete(),
+                                            metadata, payload);
     }
 
     /**
